@@ -51,7 +51,7 @@ export class Peer {
   }
 
   #dispatch(msg) {
-    if (msg.command === 'version') { this.send('verack'); return; }
+    if (msg.command === 'version') { this.peerVersion = msg.payload; this.send('verack'); return; }
     if (msg.command === 'ping') { this.send('pong', { nonce: msg.payload?.nonce ?? 0 }); return; }
     for (let i = this.waiters.length - 1; i >= 0; i--) {
       if (this.waiters[i].commands.includes(msg.command)) {
