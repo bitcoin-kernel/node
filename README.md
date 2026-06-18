@@ -12,18 +12,32 @@ persist the chain to OPFS, and sync through a thin local bridge. Built on the
 npm install
 npm test                      # deterministic testnet4 consensus checks
 npm run bench                 # header-validation throughput
-node src/sync-testnet4.mjs    # live: sync + fully validate the testnet4 header chain
+node src/sync-testnet4.js     # live: sync + fully validate the testnet4 header chain
 ```
 
-`sync-testnet4.mjs` connects to a real testnet4 peer over TCP, syncs the whole
-header chain from genesis, fully validates it (proof of work, difficulty, the
-BIP 94 timewarp fix, the 20-minute min-difficulty walk-back), persists it, and
-checks the tip against a public explorer. Recent run: **140k headers downloaded
-in ~3s, all validated, tip matched mempool.space/testnet4.** Header validation
-on the pure-JS engine measures **~15k headers/sec** single-core.
+`sync-testnet4.js` connects to a real testnet4 peer over TCP, syncs the header
+chain, fully validates it incrementally (proof of work, difficulty, the BIP 94
+timewarp fix, the 20-minute min-difficulty walk-back), handles reorgs by the
+most-work rule, persists it, **resumes** from disk on the next run, and
+cross-checks the tip against other p2p peers (never a third-party explorer).
+Recent run: **140k headers, all validated, persisted; a resume completed in
+0.3s.** Header validation measures **~15-21k headers/sec** on the pure-JS engine.
 
-The same flow runs in the browser over a WebSocket-to-TCP bridge; in Node it
-uses a raw TCP socket (`src/peer.mjs`) so it runs and benchmarks directly.
+## Headless and browser-ready by design
+
+The platform-specific pieces are interfaces, so the core logic is pure and
+proven headless before it ever touches a browser:
+
+- `src/store/header-store.js` — the `HeaderStore` interface with
+  `MemoryHeaderStore` (tests) and `FileHeaderStore` (Node). The browser adds
+  `OpfsHeaderStore` with the same logic over an OPFS sync access handle.
+- `src/chain/header-sync.js` — `HeaderSync`, a platform-agnostic engine that
+  resumes, validates each header, and reorgs by most-work. It depends only on
+  the store interface, the engine, and a transport-agnostic `fetchHeaders(locator)`.
+
+So the browser node is two swaps: `FileHeaderStore` → `OpfsHeaderStore`, and the
+TCP `Peer` → a WS-bridge `Peer`. Everything else is the same code, covered by
+headless unit tests (`npm test`).
 
 ## The idea: usable first, trustless later
 
