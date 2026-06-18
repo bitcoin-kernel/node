@@ -62,6 +62,21 @@ test('WalletScan: a stranger wallet is untouched (filter false positives cost on
   assert.equal(w.balance, 0n);
 });
 
+test('scanBlocks (no filters) finds coins and rejects a block failing its merkle check', async () => {
+  const SCRIPT = '0014' + '22'.repeat(20);
+  const fakeCodec = { txid: (t) => t.id, decode: (_t, x) => x };
+  const fakeGcs = { keyFor: () => new Uint8Array(16), matchAny: () => true };
+  const block = { transactions: [{ id: 'c', inputs: [{ prevout: { txid: '00'.repeat(32), vout: 0 } }], outputs: [{ scriptPubKey: SCRIPT, value: 5000000000 }] }] };
+
+  const good = new WalletScan(fakeCodec, fakeGcs).watchScript(SCRIPT);
+  const res = await good.scanBlocks({ from: 1, to: 1, headerHashAt: () => 'h', fetchBlock: () => block, verifyBlock: () => true });
+  assert.equal(res.touched, 1);
+  assert.equal(good.balance, 5000000000n);
+
+  const bad = new WalletScan(fakeCodec, fakeGcs).watchScript(SCRIPT);
+  await assert.rejects(() => bad.scanBlocks({ from: 1, to: 1, headerHashAt: () => 'h', fetchBlock: () => block, verifyBlock: () => false }), /merkle check/);
+});
+
 test('WalletScan tracks a spend (receive then spend nets to zero)', async () => {
   // synthetic two-block scenario over a fake codec, to exercise UTXO spend tracking
   const SCRIPT = '0014' + '11'.repeat(20);

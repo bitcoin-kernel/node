@@ -1,11 +1,13 @@
-// Tier 0 payoff, live: a Neutrino (BIP 157/158) wallet scan over testnet4.
-// Sync headers, then for a watched script: download compact filters, match,
-// fetch only the matching blocks, and report received/spent coins.
+// Tier 0 payoff, live: a light wallet over testnet4. Sync + validate headers,
+// then find a watched script's coins. Two paths, same trust (everything is
+// checked against our proof-of-work-validated headers):
+//   1. compact filters (BIP 158) if a peer serves them (private, efficient)
+//   2. else a block scan over plain p2p, each block's merkle root verified
+//      against our header (no third-party server, no filter peer needed)
 //
-// Self-validating by default: it watches the coinbase output of a recent block,
+// Self-validating by default: watches the coinbase output of a recent block,
 // so the scan must rediscover it. Override with WATCH=<scriptPubKey hex>.
-//
-// Run: `node src/scan-testnet4.js`   (or `WATCH=0014... node src/scan-testnet4.js`)
+// Run: `node src/scan-testnet4.js`
 import dns from 'node:dns/promises';
 import { readFile } from 'node:fs/promises';
 import { Codec } from '@bitcoin-desktop/schema/codec/codec.js';
@@ -42,89 +44,66 @@ async function candidates() {
   return c;
 }
 async function connectPeer(host) { const peer = new Peer(p2p, codec); await peer.connect(host, params.port); return peer; }
+async function firstPeer(hosts) { while (hosts.length) { try { return await connectPeer(hosts.shift()); } catch {} } throw new Error('no peer'); }
+const getBlock = async (peer, hash) => { peer.send('getdata', { items: [{ type: 2, hash }] }); return (await peer.waitFor(['block'], 20000)).payload; };
 
-// --- headers (resume or sync) so we know block hashes by height ---
+// --- headers (resume + sync) ---
 const store = new FileHeaderStore(codec, he, genesisHeader, HEADERS_FILE);
 await store.load();
-{
-  const hosts = await candidates();
-  let peer;
-  while (hosts.length && !peer) { try { peer = await connectPeer(hosts.shift()); } catch {} }
-  if (!peer) throw new Error('no peer');
-  console.log(`syncing headers (have ${fmt(store.height)})...`);
-  const sync = new HeaderSync(store, he, codec);
-  await sync.sync(async (locator) => { peer.send('getheaders', { version: 70016, blockLocator: locator, hashStop: '0'.repeat(64) }); return (await peer.waitFor(['headers'])).payload?.entries?.map((e) => e.header) ?? []; });
-  peer.close();
-}
+const peer = await firstPeer(await candidates());
+console.log(`syncing headers (have ${fmt(store.height)})...`);
+await new HeaderSync(store, he, codec).sync(async (locator) => { peer.send('getheaders', { version: 70016, blockLocator: locator, hashStop: '0'.repeat(64) }); return (await peer.waitFor(['headers'])).payload?.entries?.map((e) => e.header) ?? []; });
 console.log(`header tip: height ${fmt(store.height)}`);
 
-// --- find a peer that serves compact filters (NODE_COMPACT_FILTERS) ---
-async function getFilters(peer, from, stopHash, count) {
-  peer.send('getcfilters', { filterType: 0, startHeight: from, stopHash });
-  const map = new Map();
-  for (let i = 0; i < count; i++) {
-    const m = await peer.waitFor(['cfilter'], 15000);
-    map.set(m.payload.blockHash, hexToBytes(m.payload.filter));
-  }
-  return map;
-}
-async function getBlock(peer, hash) {
-  peer.send('getdata', { items: [{ type: 2, hash }] });
-  return (await peer.waitFor(['block'], 20000)).payload;
-}
-
 const to = store.height;
-const SPAN = 50;
+const SPAN = Number(process.env.SPAN || 50);
 const from = Math.max(1, to - SPAN + 1);
 const stopHash = store.tipHash();
+const headerHashAt = (h) => codec.blockHash(store.headerAt(h));
 
-async function filterPeer() {
-  const hosts = await candidates();
-  while (hosts.length) {
-    let peer;
-    try { peer = await connectPeer(hosts.shift()); } catch { continue; }
-    try { peer.send('getcfilters', { filterType: 0, startHeight: to, stopHash }); await peer.waitFor(['cfilter'], 7000); console.log(`filter peer found`); return peer; }
-    catch { peer.close(); }
-  }
-  throw new Error('no reachable testnet4 peer serves compact filters');
-}
-let peer;
-try { peer = await filterPeer(); }
-catch {
-  console.log('\nNo reachable testnet4 peer advertises NODE_COMPACT_FILTERS (bit 6).');
-  console.log('Public testnet4 nodes rarely enable blockfilterindex, so the live filter scan');
-  console.log('needs a filter-serving source: point this at your own node');
-  console.log('(bitcoind -testnet4 -blockfilterindex=1 -peerblockfilters=1), or supply filters');
-  console.log('another way. The BIP 158 match + wallet logic is proven by `npm test`.');
-  process.exit(0);
-}
-
-// --- pick a watch target: a recent block's coinbase output (self-validating) ---
+// --- watch target ---
 let watchScript = process.env.WATCH;
-let watchDesc;
-if (watchScript) { watchDesc = `script ${watchScript.slice(0, 16)}… (from WATCH)`; }
+if (watchScript) console.log(`watching script ${watchScript.slice(0, 16)}… (from WATCH)`);
 else {
   const sample = await getBlock(peer, store.tipHash());
-  const out = sample.transactions[0].outputs.find((o) => o.scriptPubKey && !o.scriptPubKey.startsWith('6a'));
-  watchScript = out.scriptPubKey;
-  watchDesc = `the coinbase output of block ${fmt(to)} (self-validating)`;
+  watchScript = sample.transactions[0].outputs.find((o) => o.scriptPubKey && !o.scriptPubKey.startsWith('6a')).scriptPubKey;
+  console.log(`watching the coinbase output of block ${fmt(to)} (self-validating)`);
 }
-console.log(`watching ${watchDesc}`);
-
-// --- scan ---
-const filters = await getFilters(peer, from, stopHash, to - from + 1);
-console.log(`downloaded ${filters.size} compact filters for blocks ${fmt(from)}..${fmt(to)}`);
 const wallet = new WalletScan(codec, gcs).watchScript(watchScript);
-const res = await wallet.scan({
-  from, to,
-  headerHashAt: (h) => store.tipHash() && codec.blockHash(store.headerAt(h)),
-  fetchFilter: (hash) => filters.get(hash),
-  fetchBlock: (hash) => getBlock(peer, hash),
-  onMatch: ({ height, recv, spent }) => console.log(`  block ${fmt(height)}: ${recv} received, ${spent} spent`),
-});
+const onMatch = ({ height, recv, spent }) => console.log(`  block ${fmt(height)}: ${recv} received, ${spent} spent`);
+
+// --- try compact filters; otherwise verified block scan over p2p ---
+async function findFilterPeer() {
+  const hosts = await candidates();
+  for (let n = 0; n < 8 && hosts.length; n++) {
+    let p;
+    try { p = await connectPeer(hosts.shift()); } catch { continue; }
+    if ((BigInt(p.peerVersion?.services ?? 0) & 64n) === 0n) { p.close(); continue; } // NODE_COMPACT_FILTERS
+    try { p.send('getcfilters', { filterType: 0, startHeight: to, stopHash }); await p.waitFor(['cfilter'], 6000); return p; } catch { p.close(); }
+  }
+  return null;
+}
+
+let res, mode;
+const fp = await findFilterPeer();
+if (fp) {
+  mode = 'compact filters (BIP 158)';
+  const filters = new Map();
+  fp.send('getcfilters', { filterType: 0, startHeight: from, stopHash });
+  for (let i = 0; i < to - from + 1; i++) { const m = await fp.waitFor(['cfilter'], 15000); filters.set(m.payload.blockHash, hexToBytes(m.payload.filter)); }
+  console.log(`downloaded ${filters.size} compact filters for blocks ${fmt(from)}..${fmt(to)}`);
+  res = await wallet.scan({ from, to, headerHashAt, fetchFilter: (h) => filters.get(h), fetchBlock: (h) => getBlock(fp, h), onMatch });
+  fp.close();
+} else {
+  mode = 'block scan over p2p (no filter peer; each block verified against our header)';
+  console.log(`no peer serves compact filters; ${mode}`);
+  const verifyBlock = (block, h) => codec.merkleRoot(block.transactions.map((t) => codec.txid(t))) === store.headerAt(h).merkleRoot;
+  res = await wallet.scanBlocks({ from, to, headerHashAt, fetchBlock: (h) => getBlock(peer, h), verifyBlock, onMatch });
+}
 peer.close();
 
-console.log(`\nscanned ${SPAN} blocks by filter; fetched ${res.candidates} matching block(s)`);
+console.log(`\nmode: ${mode}`);
+console.log(`scanned blocks ${fmt(from)}..${fmt(to)} (${SPAN}); wallet touched in ${res.touched} block(s)`);
 console.log(`wallet: ${res.utxos} UTXO(s), balance ${btc(wallet.balance)} tBTC, ${wallet.history.length} history entr${wallet.history.length === 1 ? 'y' : 'ies'}`);
-if (res.touched > 0) console.log(`✓ the scan rediscovered the watched coins via BIP 158 filters, downloading only ${res.candidates} of ${SPAN} blocks`);
+if (res.touched > 0) console.log(`✓ rediscovered the watched coins, every block verified against our PoW-validated headers`);
 else console.log(`(no coins for this script in the last ${SPAN} blocks)`);

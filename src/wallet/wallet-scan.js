@@ -46,6 +46,23 @@ export class WalletScan {
     return { candidates, touched, balance: this.balance, utxos: this.utxos.size };
   }
 
+  // Privacy-preserving scan over plain p2p: fetch every block in the range and
+  // apply it. No filters, no server. `verifyBlock(block, height, hash)` ties each
+  // block to our validated header (recompute its merkle root) so it stays SPV-grade.
+  async scanBlocks({ from, to, headerHashAt, fetchBlock, verifyBlock, onMatch } = {}) {
+    let touched = 0;
+    for (let h = from; h <= to; h++) {
+      const blockHash = await headerHashAt(h);
+      if (!blockHash) continue;
+      const got = await fetchBlock(blockHash);
+      const block = got && got.transactions ? got : this.codec.decode('Block', got);
+      if (verifyBlock && !verifyBlock(block, h, blockHash)) throw new Error(`block ${h} failed its merkle check against the validated header`);
+      const hit = this.#applyBlock(block, h);
+      if (hit) { touched++; onMatch?.({ height: h, blockHash, ...hit }); }
+    }
+    return { touched, balance: this.balance, utxos: this.utxos.size };
+  }
+
   #applyBlock(block, height) {
     let recv = 0, spent = 0;
     for (const tx of block.transactions) {
