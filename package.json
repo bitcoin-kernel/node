@@ -1,0 +1,14 @@
+{
+  "name": "bitcoin-kernel-node",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser-native Bitcoin node, built on bitcoin-kernel. Tests and benchmarks run in Node.",
+  "scripts": {
+    "test": "node --test",
+    "bench": "node bench/headers-validate.js"
+  },
+  "dependencies": {
+    "@bitcoin-desktop/schema": "github:bitcoin-desktop/schema#gh-pages"
+  }
+}
