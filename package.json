@@ -6,9 +6,13 @@
   "description": "Browser-native Bitcoin node, built on bitcoin-kernel. Tests and benchmarks run in Node.",
   "scripts": {
     "test": "node --test",
-    "bench": "node bench/headers-validate.js"
+    "bench": "node bench/headers-validate.js",
+    "bench:secp": "node bench/secp-verify.js"
   },
   "dependencies": {
     "@bitcoin-desktop/schema": "github:bitcoin-desktop/schema#gh-pages"
+  },
+  "devDependencies": {
+    "tiny-secp256k1": "^2.2.4"
   }
 }
