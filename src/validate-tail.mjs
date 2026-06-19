@@ -26,13 +26,15 @@ const chainSchema = await load('schema/chain.jsonld');
 const validateSchema = await load('schema/validate.jsonld');
 const scriptSchema = await load('schema/script.jsonld');
 const t4 = await load('test/vectors/testnet4.json');
-// Parallel signature verification (worker threads: low memory, just sig data).
-// phase 1 records sigs + returns true; phase 2 verifies in the pool; phase 3
-// re-validates a block inline (the authority) iff any sig fails. Self-correcting.
-const pool = new VerifyPool();
-const defer = makeDeferBackend();
-setVerifyBackend(defer.backend);
+// Signature verification: NOPOOL=1 -> inline WASM (fast for light post-flood
+// blocks, where pool dispatch overhead exceeds the few sigs it parallelizes);
+// default -> worker-thread pool (CCheckQueue 3-phase, fast for the heavy flood).
+const NOPOOL = process.env.NOPOOL === '1';
+let pool = null, defer = null;
+if (NOPOOL) { setVerifyBackend(wasmBackend); }
+else { pool = new VerifyPool(); defer = makeDeferBackend(); setVerifyBackend(defer.backend); }
 setSha256Backend(nativeSha256);
+console.log(NOPOOL ? 'verify: inline WASM (no pool)' : `verify: ${pool.size}-worker pool`);
 const he = HeaderEngine.fromSchemas(codec, chainSchema, validateSchema, 'btc:testnet4');
 const be = BlockEngine.fromSchemas(codec, chainSchema, validateSchema, scriptSchema, 'btc:testnet4');
 
@@ -65,7 +67,7 @@ const saveCkpt = async (h) => { const tmp = new URL('validate-tail-ckpt.tmp', DA
 
 let validated = 0, applied = 0;
 const t0 = Date.now();
-process.on('SIGINT', async () => { console.log('\ncheckpointing before exit...'); await saveCkpt(lastH); try { await pool.close(); } catch {} process.exit(0); });
+process.on('SIGINT', async () => { console.log('\ncheckpointing before exit...'); await saveCkpt(lastH); try { if (pool) await pool.close(); } catch {} process.exit(0); });
 let lastH = start - 1;
 
 for (let h = start; h <= TIP; h++) {
@@ -77,22 +79,29 @@ for (let h = start; h <= TIP; h++) {
     const times = []; for (let j = Math.max(1, h - 11); j < h; j++) times.push(store.headerAt(j).time);
     const mtp = median(times);
     const collect = (ctx, results) => { const w = []; for (const r of results) if (r.ok === false) w.push([r.label, r.error]); if (ctx?.spending?.valueUnresolved > 0) w.push(['value-unresolved', String(ctx.spending.valueUnresolved)]); return w; };
-    let pend = null, threw = null;
-    try {
-      const ctx = be.validateBlockContext(block, { height: h, utxo, external: new Map(), mtp });
-      pend = collect(ctx, [...be.validateBlockStructure(block).results, ...ctx.results]);
-    } catch (e) { threw = String(e.message).slice(0, 50); }
-    const recs = defer.take();
-    const sigsOk = threw ? false : await pool.verifyAll(recs);
-    if (threw) warn('engine-threw', threw, h);
-    else if (sigsOk) { for (const [l, e] of pend) warn(l, e, h); }
-    else {
-      setVerifyBackend(wasmBackend);
+    if (NOPOOL) {
       try {
         const ctx = be.validateBlockContext(block, { height: h, utxo, external: new Map(), mtp });
         for (const [l, e] of collect(ctx, [...be.validateBlockStructure(block).results, ...ctx.results])) warn(l, e, h);
       } catch (e) { warn('engine-threw', String(e.message).slice(0, 50), h); }
-      setVerifyBackend(defer.backend); defer.take();
+    } else {
+      let pend = null, threw = null;
+      try {
+        const ctx = be.validateBlockContext(block, { height: h, utxo, external: new Map(), mtp });
+        pend = collect(ctx, [...be.validateBlockStructure(block).results, ...ctx.results]);
+      } catch (e) { threw = String(e.message).slice(0, 50); }
+      const recs = defer.take();
+      const sigsOk = threw ? false : await pool.verifyAll(recs);
+      if (threw) warn('engine-threw', threw, h);
+      else if (sigsOk) { for (const [l, e] of pend) warn(l, e, h); }
+      else {
+        setVerifyBackend(wasmBackend);
+        try {
+          const ctx = be.validateBlockContext(block, { height: h, utxo, external: new Map(), mtp });
+          for (const [l, e] of collect(ctx, [...be.validateBlockStructure(block).results, ...ctx.results])) warn(l, e, h);
+        } catch (e) { warn('engine-threw', String(e.message).slice(0, 50), h); }
+        setVerifyBackend(defer.backend); defer.take();
+      }
     }
     validated++;
   } else { applied++; }
@@ -109,5 +118,5 @@ process.stdout.write('\n');
 console.log(`\n=== tail validation ${fmt(VALIDATE_FROM)}..${fmt(TIP)}: ${fmt(validated)} blocks validated (${fmt(applied)} apply-only rebuild), ${((Date.now() - t0) / 60000).toFixed(1)} min ===`);
 if (!warnings.size) console.log('  no rule failures');
 else for (const [k, e] of [...warnings.entries()].sort((a, b) => b[1].count - a[1].count)) console.log(`    ${fmt(e.count).padStart(8)}x  ${k}  (first @ ${fmt(e.firstHeight)})`);
-await pool.close();
+if (pool) await pool.close();
 process.exit(0);
