@@ -70,7 +70,12 @@ try { const c = JSON.parse(await readFile(CKPT, 'utf8')); for (const [k, v] of c
 
 const TIP = Math.min(store.height, Number(process.env.MAXH || store.height));
 const warnings = new Map();
-const warn = (label, error, h) => { const k = `${label}:${error || ''}`; const e = warnings.get(k) || { count: 0, firstHeight: h }; e.count++; warnings.set(k, e); };
+const warn = (label, error, h) => {
+  const k = `${label}:${error || ''}`;
+  const e = warnings.get(k);
+  if (!e) { warnings.set(k, { count: 1, firstHeight: h }); process.stdout.write(`\nNEW engine discrepancy: ${k} (first at height ${fmt(h)})\n`); }
+  else e.count++;
+};
 let validated = 0, txs = 0, lastH = start - 1;
 const t0 = Date.now();
 
