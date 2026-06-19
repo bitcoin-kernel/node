@@ -65,12 +65,16 @@ export class VerifyPool {
       const chunk = packed.slice(lo * REC, hi * REC); // own buffer, transferable
       const worker = this.workers[wi];
       jobs.push(new Promise((resolve) => {
-        worker.once('message', (out) => resolve(out));
+        const onMsg = (out) => { cleanup(); resolve(out); };
+        const onErr = () => { cleanup(); resolve(null); }; // worker died -> can't trust; force inline recheck
+        const cleanup = () => { worker.off('message', onMsg); worker.off('error', onErr); };
+        worker.once('message', onMsg);
+        worker.once('error', onErr);
         worker.postMessage(chunk, [chunk.buffer]);
       }));
     }
     const parts = await Promise.all(jobs);
-    for (const out of parts) for (let i = 0; i < out.length; i++) if (out[i] === 0) return false;
+    for (const out of parts) { if (!out) return false; for (let i = 0; i < out.length; i++) if (out[i] === 0) return false; }
     return true;
   }
 

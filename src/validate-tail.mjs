@@ -98,7 +98,7 @@ for (let h = start; h <= TIP; h++) {
   } else { applied++; }
   try { be.applyBlock(utxo, block, h); } catch (e) { warn('applyBlock-threw', String(e.message).slice(0, 40), h); }
   lastH = h;
-  if (h % 2000 === 0 || h === TIP) {
+  if (h % 250 === 0 || h === TIP) {
     const secs = (Date.now() - t0) / 1000;
     process.stdout.write(`\r  h ${fmt(h)}/${fmt(TIP)}  applied ${fmt(applied)} validated ${fmt(validated)}  utxo ${fmt(utxo.size)}  warns ${warnings.size}  ${(((h - start + 1) / secs)).toFixed(0)} blk/s   `);
   }
