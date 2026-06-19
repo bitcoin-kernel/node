@@ -96,6 +96,47 @@ move past in two consecutive 14-minute checks — reading every block offline fr
 the local archive (no network), no per-block hang. The crypto backend was the
 only thing in the way, and it is now in place.
 
+## Engine bug #4 (performance): O(n²) sighash — found, fixed, measured
+
+WASM uncovered the *next* wall. Past ~51,470 the validator appeared to stall
+again — but the OS counters told the real story: 100% userspace CPU, **zero
+syscalls, and a completely flat minor-fault count (no allocation)**. That rules
+out GC and I/O — it was a tight compute loop. A clean process validated the same
+blocks in milliseconds, so it was not the blocks themselves but accumulated work.
+
+The culprit: **the engine recomputed the BIP143/BIP341 sighash midstates on every
+input instead of once per transaction.** `hashPrevouts`, `hashSequence`,
+`hashOutputs` (segwit) and `sha_prevouts/amounts/scriptpubkeys/sequences/outputs`
+(taproot) depend only on the whole tx — Bitcoin Core precomputes them once
+(`PrecomputedTransactionData`). Recomputed per input, an n-input segwit/taproot
+transaction is **O(n²)** in SHA-256. testnet4 block 51,478 contains a real
+**1,420-input** consolidation; the block took **84 seconds** to validate, and the
+next two (51,479/51,480, ~14k inputs each) never finished at all.
+
+Fixed in the engine ([schema](https://github.com/bitcoin-desktop/schema)) by
+memoizing the midstates per tx via a `WeakMap` — byte-identical output (all 132
+engine tests pass, including the BIP143/341 script-vector differentials), only the
+redundant recomputation removed. Measured on the same blocks:
+
+| block | inputs | before | after |
+|------:|-------:|-------:|------:|
+| 51,478 | 14,239 | 84,283 ms | **7,492 ms** |
+| 51,479 | 14,250 | never finished | **8,232 ms** |
+| 51,480 | 14,264 | never finished | **7,709 ms** |
+
+~11x, and the difference between "completes" and "doesn't." With WASM-secp (per-
+signature) and the sighash cache (per-transaction) together, the inscription flood
+goes from *months* to *tens of minutes*. The remaining ~7.5s/block is the 14k WASM
+sig-verifies plus O(n) hashing; a WASM SHA-256 is the next lever, but the flood is
+now completable — which was the goal.
+
+Note: two scares along the way turned out to be non-issues — a discrepancy at
+height 50,371 was **bug #61 recurring** (the tapscript 10 kB limit, already
+filed), not new; and an apparent "witness-stripped archive" was a field-name
+mistake in a probe (witness lives at `tx.witness[i]`, not `input.witness`). The
+archive is intact and the WASM path agrees with pure-JS on real testnet4 blocks,
+not just Core's vectors.
+
 ## Honest boundaries
 
 - testnet4 only here (mainnet is a network-param flip; not run).
