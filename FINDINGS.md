@@ -5,9 +5,16 @@ testnet4 chain: download + archive every block over p2p, then fully validate
 each one from disk and treat any consensus-rule failure as an engine bug to
 catalogue (the chain is valid by definition, so a failure is a bug in us).
 
-## Engine bugs found (both filed against the engine, bitcoin-desktop/schema)
+## Engine bugs found (all filed against, and now fixed in, bitcoin-desktop/schema)
 
-1. **BIP34 `coinbase-height` for heights 1-16** — [schema#60](https://github.com/bitcoin-desktop/schema/issues/60).
+**Status: all four are fixed and merged to the engine's `gh-pages`, each with a
+regression test and the Bitcoin Core `script_tests.json` differential still
+green.** schema [#60](https://github.com/bitcoin-desktop/schema/issues/60),
+[#61](https://github.com/bitcoin-desktop/schema/issues/61),
+[#62](https://github.com/bitcoin-desktop/schema/issues/62),
+[#63](https://github.com/bitcoin-desktop/schema/issues/63) — closed.
+
+1. **BIP34 `coinbase-height` for heights 1-16** — [schema#60](https://github.com/bitcoin-desktop/schema/issues/60). **Fixed.**
    `bip34Height` only parses a length-prefixed push; heights 1-16 are pushed as
    OP_1..OP_16 (the minimal encoding), so it returns `null` and the rule fails on
    the first 16 blocks of any chain that enforces BIP34 from genesis (testnet4,
@@ -15,7 +22,7 @@ catalogue (the chain is valid by definition, so a failure is a bug in us).
    the rule is skipped). Minor.
 
 2. **BIP342 tapscript wrongly hitting the legacy 10 kB `MAX_SCRIPT_SIZE`** —
-   [schema#61](https://github.com/bitcoin-desktop/schema/issues/61). **Consensus-critical.**
+   [schema#61](https://github.com/bitcoin-desktop/schema/issues/61). **Consensus-critical. Fixed.**
    The interpreter applies the legacy 10,000-byte script-size limit to Taproot
    script-path (tapscript) execution, but BIP342 removed it. So large Taproot
    inscription / DMT-mint spends are rejected as `"script too large"`. Pinned to
@@ -196,13 +203,19 @@ limit wrongly applied to tapscript isn't an edge case — it rejects a large fra
 of otherwise-valid blocks. This is the concrete, real-chain evidence that #61 is
 consensus-critical, not theoretical.
 
+The 37× engine throw was the same root cause as schema#62 (an `OP_PUSHDATA4`
+signed-length overflow crashing the parser on coinbase scriptSig data), now
+fixed. So both tail signatures map onto already-fixed engine bugs.
+
 **Bottom line: the full testnet4 chain (140,550 blocks) is fully validated, with no
-undocumented rule failure. Every divergence reduces to the four filed engine bugs
-plus one robustness throw — the engine agrees with the real chain everywhere else.**
+undocumented rule failure. Every divergence reduces to the four engine bugs it
+surfaced — all of which are now fixed and merged. The engine agrees with the real
+chain everywhere else.**
 
 ## Honest boundaries
 
 - testnet4 only here (mainnet is a network-param flip; not run).
-- The two engine bugs are in the engine (schema), not this repo; filed, not fixed.
+- The four engine bugs live in the engine (schema), not this repo; all are now
+  fixed and merged there (schema #60/#61/#62/#63 closed), each with a regression test.
 - Public testnet4 peers don't serve compact filters (0/10), so the live wallet
   uses a verified p2p block scan; Electrum is the noted path for efficient SPV.
