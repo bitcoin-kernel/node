@@ -137,6 +137,40 @@ mistake in a probe (witness lives at `tx.witness[i]`, not `input.witness`). The
 archive is intact and the WASM path agrees with pure-JS on real testnet4 blocks,
 not just Core's vectors.
 
+## Throughput, layer by layer (all measured on flood block 51,478, 14,239 inputs)
+
+Each fix exposed the next bottleneck. The cumulative effect:
+
+| stage | block 51,478 | what was bounding it |
+|------:|-------------:|----------------------|
+| pure-JS, O(n²) sighash | 84,283 ms | per-input sighash recomputation |
+| + WASM secp + sighash cache | 7,492 ms | per-input interpreter + secp |
+| + native SHA-256 | 7,866 ms | (hashing wasn't the bound here) |
+| secp **stubbed** (shows the floor) | 4,501 ms | interpreter/UTXO (~57%) |
+| + **parallel verify** (14 workers) | **4,802 ms** | phase-1 interpreter (single-threaded) |
+
+Three backends, each injected through a zero-dependency engine hook and each
+gated by a consensus-equivalence proof, none of them changing the engine's
+default pure-JS behaviour:
+
+- **WASM secp** (`setVerifyBackend`) — tiny-secp256k1; agrees with pure-JS on
+  Core's vectors and on real testnet4 blocks.
+- **Native SHA-256** (`setSha256Backend`) — node:crypto; byte-identical to the
+  pure-JS hash on length boundaries + 2000 random inputs.
+- **Parallel verify pool** (CCheckQueue pattern) — phase 1 records each
+  signature check and returns true optimistically; phase 2 verifies across a
+  worker pool; phase 3 re-validates a block inline (the authority) iff any check
+  fails. Self-correcting: a block takes the fast path only if every recorded
+  signature truly verified. A bounded 50k→51.5k run through the flood found
+  exactly the known bug #61 with zero false positives.
+
+What remains bounding the flood is the **single-threaded phase-1 interpreter**
+(~4s/block: sighash construction + script execution + UTXO ops for 14k inputs).
+Range-parallel validation across processes would parallelize that too; the
+signature pool was the chosen, lower-risk step. The full validation now completes
+in hours rather than months, and the audit's bug catalogue stands at four
+(schema #60, #61, #62, #63).
+
 ## Honest boundaries
 
 - testnet4 only here (mainnet is a network-param flip; not run).
