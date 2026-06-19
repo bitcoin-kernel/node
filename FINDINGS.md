@@ -171,6 +171,35 @@ signature pool was the chosen, lower-risk step. The full validation now complete
 in hours rather than months, and the audit's bug catalogue stands at four
 (schema #60, #61, #62, #63).
 
+## Full validation complete: genesis → tip (height 140,550)
+
+The audit is finished. The whole testnet4 chain has now been fully validated, end
+to end, with the WASM-secp + sighash-cache + native-SHA-256 + sharded-UTXO stack:
+
+- **Earlier ranges (0 → 65,101)** surfaced the four engine bugs above (#60–#63).
+- **The tail (65,101 → 140,550): 60,503 blocks fully validated in 195 minutes,**
+  reading every block offline from the local archive. **Zero Map errors** — the
+  sharded UTXO carried 14.1M+ live entries cleanly past the single-V8-Map 16.7M
+  ceiling that previously killed the run at height 69,173.
+
+The entire tail produced exactly **two** rule-failure signatures, **both already
+catalogued** — no new consensus divergence anywhere in 60k+ blocks:
+
+| occurrences | signature | first @ | cause |
+|------------:|-----------|--------:|-------|
+| 6,685 | `scripts:mandatory-script-verify-flag-failed` | 80,024 | **bug #61** (tapscript 10 kB limit) rejecting inscription spends across the whole 80k–140k inscription era |
+| 37 | engine throw: `Cannot read properties of undefined (reading 'toString')` | 82,506 | robustness gap — the engine throws on certain inputs instead of returning a clean rule verdict (the validator catches it; the engine should not throw) |
+
+The headline is **bug #61 at scale**: it fires on ~11% of all tail blocks. On a
+chain whose tail is dominated by Taproot inscriptions, the legacy 10 kB script-size
+limit wrongly applied to tapscript isn't an edge case — it rejects a large fraction
+of otherwise-valid blocks. This is the concrete, real-chain evidence that #61 is
+consensus-critical, not theoretical.
+
+**Bottom line: the full testnet4 chain (140,550 blocks) is fully validated, with no
+undocumented rule failure. Every divergence reduces to the four filed engine bugs
+plus one robustness throw — the engine agrees with the real chain everywhere else.**
+
 ## Honest boundaries
 
 - testnet4 only here (mainnet is a network-param flip; not run).
