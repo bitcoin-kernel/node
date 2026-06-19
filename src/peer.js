@@ -14,13 +14,20 @@ export class Peer {
     this.closed = false;
   }
 
-  // Collect `count` messages of `command` (for pipelined batch downloads).
-  collect(command, count, timeoutMs = 60000) {
+  // Collect `count` messages of `command`. With `onItem`, each message is
+  // handled and discarded as it arrives (bounded memory for big-block batches);
+  // otherwise the messages are accumulated and returned.
+  collect(command, count, { onItem, timeoutMs = 90000 } = {}) {
     return new Promise((resolve, reject) => {
-      const out = [];
-      const l = { command, fn: (msg) => { out.push(msg); if (out.length >= count) { done(); resolve(out); } } };
-      const timer = setTimeout(() => { done(); reject(new Error(`collect timeout: ${out.length}/${count} ${command}`)); }, timeoutMs);
+      let n = 0;
+      const out = onItem ? null : [];
       const done = () => { clearTimeout(timer); const i = this.listeners.indexOf(l); if (i >= 0) this.listeners.splice(i, 1); };
+      const l = { command, fn: (msg) => {
+        n++;
+        if (onItem) { try { onItem(msg); } catch (e) { done(); reject(e); return; } } else out.push(msg);
+        if (n >= count) { done(); resolve(onItem ? n : out); }
+      } };
+      const timer = setTimeout(() => { done(); reject(new Error(`collect timeout: ${n}/${count} ${command}`)); }, timeoutMs);
       l.cancel = () => { done(); reject(new Error('peer closed')); };
       this.listeners.push(l);
     });

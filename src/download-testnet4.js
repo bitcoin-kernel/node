@@ -16,6 +16,7 @@ import { P2pEngine } from '@bitcoin-desktop/schema/codec/p2p.js';
 import { HeaderEngine } from '@bitcoin-desktop/schema/codec/headers.js';
 import { Peer } from './peer.js';
 import { FileHeaderStore } from './store/header-store.js';
+import { FileBlockStore } from './store/block-store.js';
 import { HeaderSync } from './chain/header-sync.js';
 
 const load = async (p) => JSON.parse(await readFile(new URL(import.meta.resolve('@bitcoin-desktop/schema/' + p)), 'utf8'));
@@ -43,6 +44,7 @@ async function firstPeer() { const hosts = await candidates(); while (hosts.leng
 const getBlock = async (peer, hash) => { peer.send('getdata', { items: [{ type: WITNESS_BLOCK, hash }] }); return (await peer.waitFor(['block'], 30000)).payload; };
 
 const store = new FileHeaderStore(codec, he, genesisHeader, HEADERS_FILE);
+const blockStore = new FileBlockStore(DATA, codec);
 await store.load();
 let peer = await firstPeer();
 console.log(`syncing headers (have ${fmt(store.height)})...`);
@@ -53,44 +55,51 @@ let start = 1, bytes = 0;
 try { const c = JSON.parse(await readFile(CKPT, 'utf8')); start = c.height + 1; bytes = c.bytes || 0; console.log(`resuming download from ${fmt(start)} (${(bytes / 1e9).toFixed(2)} GB so far)`); } catch {}
 
 const TIP = store.height;
-const BATCH = Number(process.env.BATCH || 256); // pipelined: one getdata per batch
+const BATCH = Number(process.env.BATCH || 32); // pipelined; stream-verified to bound memory
 const t0 = Date.now();
 let done = 0;
 const checkpoint = async (h) => { await mkdir(DATA, { recursive: true }); await writeFile(CKPT, JSON.stringify({ height: h, bytes })); };
 
-// fetch a contiguous [lo, hi] window in one getdata, return Map(blockHash -> block)
+// request a [lo, hi] window in one getdata; verify each block as it streams in
 async function fetchWindow(lo, hi) {
-  const hashes = [];
-  for (let k = lo; k <= hi; k++) hashes.push(codec.blockHash(store.headerAt(k)));
-  for (let attempt = 0; attempt < 3; attempt++) {
+  const want = new Map();
+  for (let k = lo; k <= hi; k++) want.set(codec.blockHash(store.headerAt(k)), k);
+  for (let attempt = 0; want.size && attempt < 5; attempt++) {
+    const need = [...want.keys()];
     try {
-      peer.send('getdata', { items: hashes.map((hash) => ({ type: WITNESS_BLOCK, hash })) });
-      const msgs = await peer.collect('block', hashes.length, 90000);
-      return new Map(msgs.map((m) => [codec.blockHash(m.payload.header), m.payload]));
-    } catch { peer.close(); peer = await firstPeer(); }
+      peer.send('getdata', { items: need.map((hash) => ({ type: WITNESS_BLOCK, hash })) });
+      await peer.collect('block', need.length, { timeoutMs: 120000, onItem: (m) => {
+        const block = m.payload;
+        const hash = codec.blockHash(block.header);
+        const k = want.get(hash);
+        if (k == null) return;
+        const root = codec.merkleRoot(block.transactions.map((t) => codec.txid(t)));
+        if (root !== store.headerAt(k).merkleRoot) throw new Error(`merkle mismatch at height ${fmt(k)}`);
+        blockStore.putSync(k, block);     // archive the verified block to disk
+        bytes += blockStore.sizeOf(k);
+        want.delete(hash);
+        done++;
+      } });
+    } catch (e) {
+      if (String(e.message).includes('merkle mismatch')) throw e;
+      peer.close(); peer = await firstPeer();
+    }
   }
-  throw new Error(`could not fetch window ${lo}..${hi}`);
+  if (want.size) throw new Error(`window ${lo}..${hi}: ${want.size} blocks not delivered`);
 }
 
 for (let h = start; h <= TIP; h += BATCH) {
   const hi = Math.min(TIP, h + BATCH - 1);
-  const blocks = await fetchWindow(h, hi);
-  for (let k = h; k <= hi; k++) {
-    const block = blocks.get(codec.blockHash(store.headerAt(k)));
-    if (!block) { console.error(`\n✗ height ${fmt(k)}: peer omitted this block`); await checkpoint(k - 1); process.exit(1); }
-    const root = codec.merkleRoot(block.transactions.map((t) => codec.txid(t)));
-    if (root !== store.headerAt(k).merkleRoot) { console.error(`\n✗ height ${fmt(k)}: merkle mismatch`); await checkpoint(k - 1); process.exit(1); }
-    bytes += codec.encodeHex('Block', block).length / 2;
-    done++;
-  }
+  try { await fetchWindow(h, hi); }
+  catch (e) { console.error(`\n✗ ${e.message}`); await checkpoint(h - 1); process.exit(1); }
   const secs = (Date.now() - t0) / 1000;
   const rate = done / secs;
-  const eta = (TIP - hi) / rate / 60;
-  process.stdout.write(`\r  verified ${fmt(hi)}/${fmt(TIP)}  |  ${rate.toFixed(0)} blk/s  |  ${(bytes / 1e9).toFixed(2)} GB  |  ${(secs / 60).toFixed(1)} min, ETA ${eta.toFixed(1)} min   `);
+  process.stdout.write(`\r  verified ${fmt(hi)}/${fmt(TIP)}  |  ${rate.toFixed(0)} blk/s  |  ${(bytes / 1e9).toFixed(2)} GB  |  ${(secs / 60).toFixed(1)} min, ETA ${((TIP - hi) / rate / 60).toFixed(1)} min   `);
   await checkpoint(hi);
 }
 peer.close();
 await checkpoint(TIP);
 process.stdout.write('\n');
-console.log(`✓ downloaded + verified the entire testnet4 chain: ${fmt(TIP)} blocks, ${(bytes / 1e9).toFixed(2)} GB, in ${((Date.now() - t0) / 1000 / 60).toFixed(1)} min`);
+console.log(`✓ downloaded, verified and STORED the entire testnet4 chain: ${fmt(TIP)} blocks, ${(bytes / 1e9).toFixed(2)} GB on disk, in ${((Date.now() - t0) / 1000 / 60).toFixed(1)} min`);
 console.log(`  every block tied to a proof-of-work-validated header by its merkle root, all over raw p2p`);
+console.log(`  archived to data/blocks/ (the BlockStore the browser will mirror in OPFS)`);
