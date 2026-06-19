@@ -18,7 +18,9 @@ import { P2pEngine } from '@bitcoin-desktop/schema/codec/p2p.js';
 import { HeaderEngine } from '@bitcoin-desktop/schema/codec/headers.js';
 import { BlockEngine } from '@bitcoin-desktop/schema/codec/blocks.js';
 import { setVerifyBackend } from '@bitcoin-desktop/schema/codec/secp256k1.js';
+import { setSha256Backend } from '@bitcoin-desktop/schema/codec/hash.js';
 import { wasmBackend } from './wasm-secp.js';
+import { nativeSha256 } from './sha256-native.js';
 import { Peer } from './peer.js';
 import { FileHeaderStore } from './store/header-store.js';
 import { FileBlockStore } from './store/block-store.js';
@@ -37,6 +39,10 @@ const params = chainSchema['@graph'].find((n) => n['@id'] === 'btc:testnet4');
 // consensus-equivalent on Bitcoin Core's script vectors (test/wasm-secp.test.js).
 // This is what makes the inscription-flood blocks feasible to validate.
 setVerifyBackend(wasmBackend);
+// Native SHA-256 (node:crypto / OpenSSL+SHA-NI), proven byte-equivalent to the
+// engine's pure-JS hash (test/sha256-native.test.js). Removes the residual
+// hashing cost on the flood blocks after the secp swap.
+setSha256Backend(nativeSha256);
 
 const p2p = P2pEngine.fromSchemas(codec, p2pSchema, chainSchema, 'btc:testnet4');
 const he = HeaderEngine.fromSchemas(codec, chainSchema, validateSchema, 'btc:testnet4');
