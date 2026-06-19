@@ -79,6 +79,23 @@ the crypto backend. A third engine bug (#62) and a validator robustness fix
 Bottom line: **~51.5k blocks fully validated, 3 engine bugs found and filed, the
 whole chain archived (11.9 GB), and the WASM requirement proven on real data.**
 
+## WASM secp integrated — the wall is gone
+
+The remedy above is now implemented. The engine grew an injectable verify hook
+(`setVerifyBackend`, additive, still zero-dependency); the node supplies a WASM
+backend (`src/wasm-secp.js`) wrapping tiny-secp256k1 (libsecp256k1 compiled to
+WebAssembly). Crucially this is **gated by a consensus-equivalence proof**: a
+test (`test/wasm-secp.test.js`) runs Bitcoin Core's full `script_tests.json`
+through the interpreter twice — once pure-JS, once WASM — and asserts every
+verdict is identical. You do not swap consensus crypto on faith. It agrees on
+every vector.
+
+With the backend injected, the validator **resumed from the checkpoint (height
+50,000) and walked straight through the ~51,500 stall** that pure-JS could not
+move past in two consecutive 14-minute checks — reading every block offline from
+the local archive (no network), no per-block hang. The crypto backend was the
+only thing in the way, and it is now in place.
+
 ## Honest boundaries
 
 - testnet4 only here (mainnet is a network-param flip; not run).
