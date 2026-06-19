@@ -21,6 +21,7 @@ import { setVerifyBackend } from '@bitcoin-desktop/schema/codec/secp256k1.js';
 import { setSha256Backend } from '@bitcoin-desktop/schema/codec/hash.js';
 import { wasmBackend } from './wasm-secp.js';
 import { nativeSha256 } from './sha256-native.js';
+import { VerifyPool, makeDeferBackend } from './verify-pool.js';
 import { Peer } from './peer.js';
 import { FileHeaderStore } from './store/header-store.js';
 import { FileBlockStore } from './store/block-store.js';
@@ -38,11 +39,19 @@ const params = chainSchema['@graph'].find((n) => n['@id'] === 'btc:testnet4');
 // Swap the engine's pure-JS secp for WASM libsecp256k1 (~16x), proven
 // consensus-equivalent on Bitcoin Core's script vectors (test/wasm-secp.test.js).
 // This is what makes the inscription-flood blocks feasible to validate.
-setVerifyBackend(wasmBackend);
 // Native SHA-256 (node:crypto / OpenSSL+SHA-NI), proven byte-equivalent to the
-// engine's pure-JS hash (test/sha256-native.test.js). Removes the residual
-// hashing cost on the flood blocks after the secp swap.
+// engine's pure-JS hash (test/sha256-native.test.js).
 setSha256Backend(nativeSha256);
+// Parallel signature verification (Bitcoin Core CCheckQueue pattern): phase 1
+// validates with a deferring backend that records every signature check and
+// returns true optimistically; phase 2 verifies them across a worker pool; if
+// any fails, phase 3 re-validates the block inline with the real WASM backend as
+// the authority. Self-correcting — a block passes the fast path only if every
+// recorded signature truly verified. See verify-pool.js.
+const pool = new VerifyPool();
+const defer = makeDeferBackend();
+setVerifyBackend(defer.backend);
+console.log(`parallel verify: ${pool.size} worker threads`);
 
 const p2p = P2pEngine.fromSchemas(codec, p2pSchema, chainSchema, 'btc:testnet4');
 const he = HeaderEngine.fromSchemas(codec, chainSchema, validateSchema, 'btc:testnet4');
@@ -98,7 +107,7 @@ function summary() {
   if (!warnings.size) console.log('  no rule failures: the engine agreed with the real chain on every rule of every block');
   else { console.log('  engine discrepancies (rule failures on a valid chain = engine bugs to fix):'); for (const [k, e] of [...warnings.entries()].sort((a, b) => b[1].count - a[1].count)) console.log(`    ${fmt(e.count).padStart(9)}x  ${k}  (first @ height ${fmt(e.firstHeight)})`); }
 }
-process.on('SIGINT', async () => { summary(); await checkpoint(lastH); process.exit(0); });
+process.on('SIGINT', async () => { summary(); await checkpoint(lastH); try { await pool.close(); } catch {} process.exit(0); });
 
 let fromDisk = 0, fromNet = 0;
 async function fetchWindow(lo, hi) {
@@ -128,14 +137,30 @@ for (let h = start; h <= TIP; h += BATCH) {
     const root = codec.merkleRoot(block.transactions.map((t) => codec.txid(t)));
     if (root !== store.headerAt(k).merkleRoot) { console.error(`\n✗ height ${fmt(k)}: merkle mismatch (fatal)`); summary(); await checkpoint(k - 1); process.exit(1); }
     const times = []; for (let j = Math.max(1, k - 11); j < k; j++) times.push(store.headerAt(j).time);
+    const mtp = median(times);
     // The real chain is valid, so a rule failure OR a thrown exception is an
     // engine bug: log both as discrepancies and keep going (don't let one block
-    // crash the audit).
+    // crash the audit). Signature validity is confirmed in parallel (phase 2);
+    // everything else (script structure, amounts, sigops, ...) is real in phase 1.
+    const collect = (ctx, results) => { const w = []; for (const r of results) if (r.ok === false) w.push([r.label, r.error]); if (ctx?.spending?.valueUnresolved > 0) w.push(['value-unresolved', String(ctx.spending.valueUnresolved)]); return w; };
+    let pend = null, threw = null;
     try {
-      const ctx = be.validateBlockContext(block, { height: k, utxo, external: new Map(), mtp: median(times) });
-      for (const r of [...be.validateBlockStructure(block).results, ...ctx.results]) if (r.ok === false) warn(r.label, r.error, k);
-      if (ctx.spending?.valueUnresolved > 0) warn('value-unresolved', String(ctx.spending.valueUnresolved), k);
-    } catch (e) { warn('engine-threw', String(e.message).slice(0, 50), k); }
+      const ctx = be.validateBlockContext(block, { height: k, utxo, external: new Map(), mtp });
+      pend = collect(ctx, [...be.validateBlockStructure(block).results, ...ctx.results]);
+    } catch (e) { threw = String(e.message).slice(0, 50); }
+    const recs = defer.take();
+    const sigsOk = threw ? false : await pool.verifyAll(recs);
+    if (threw) warn('engine-threw', threw, k);
+    else if (sigsOk) { for (const [l, e] of pend) warn(l, e, k); } // fast path: scripts confirmed
+    else {
+      // phase 3: a signature did not verify — re-validate inline as the authority.
+      setVerifyBackend(wasmBackend);
+      try {
+        const ctx = be.validateBlockContext(block, { height: k, utxo, external: new Map(), mtp });
+        for (const [l, e] of collect(ctx, [...be.validateBlockStructure(block).results, ...ctx.results])) warn(l, e, k);
+      } catch (e) { warn('engine-threw', String(e.message).slice(0, 50), k); }
+      setVerifyBackend(defer.backend); defer.take();
+    }
     try { be.applyBlock(utxo, block, k); } catch (e) { warn('applyBlock-threw', String(e.message).slice(0, 40), k); }
     validated++; txs += block.transactions.length; lastH = k;
   }
@@ -147,3 +172,6 @@ await checkpoint(TIP);
 process.stdout.write('\n');
 console.log(`✓ ran full validation to height ${fmt(TIP)}`);
 summary();
+await pool.close();
+if (peer) try { peer.close(); } catch {}
+process.exit(0); // worker threads + any open socket would otherwise keep us alive
