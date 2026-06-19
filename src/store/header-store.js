@@ -1,14 +1,15 @@
-// HeaderStore: the storage interface the sync engine depends on. It keeps an
-// in-memory index (hash -> height, cumulative work) shared by every backend,
-// and delegates only persistence to subclasses:
+// HeaderStore: the storage interface the sync engine depends on. The base class
+// and the index are browser-safe (no Node imports); only FileHeaderStore touches
+// node:fs, lazily, so this module imports cleanly in the browser too.
 //
 //   MemoryHeaderStore  in-memory only (tests)
-//   FileHeaderStore    a flat 80-byte-per-header file (Node; OPFS stand-in)
-//   OpfsHeaderStore    later: same logic, OPFS sync access handle (browser)
+//   FileHeaderStore    a flat 80-byte-per-header file (Node)
+//   OpfsHeaderStore    the same logic over an OPFS sync access handle (browser),
+//                      in ./opfs-header-store.js
 //
-// Heights: genesis is height 0 (known from params, not stored on disk); the
-// file holds heights 1..N as raw 80-byte headers back to back.
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+// Heights: genesis is height 0 (known from params, not stored on disk); storage
+// holds heights 1..N as raw 80-byte headers back to back.
+import { hexToBytes, bytesToHex } from '@bitcoin-desktop/schema/codec/hash.js';
 
 export class HeaderStore {
   constructor(codec, headerEngine, genesisHeader) {
@@ -29,7 +30,6 @@ export class HeaderStore {
   cumWorkAt(height) { return this._work[height] ?? 0n; }
 
   // A block locator: tip, then exponentially-spaced ancestors, ending at genesis.
-  // Lets a peer find the most recent block we share and serve from there.
   locator() {
     const locs = [];
     let step = 1;
@@ -64,16 +64,14 @@ export class HeaderStore {
   // Rebuild the index from a raw header buffer (used by persistent backends).
   _ingestBytes(bytes) {
     for (let i = 0; i + 80 <= bytes.length; i += 80) {
-      const hdr = this.codec.decode('BlockHeader', Buffer.from(bytes.subarray(i, i + 80)).toString('hex'));
+      const hdr = this.codec.decode('BlockHeader', bytesToHex(bytes.subarray(i, i + 80)));
       this._h.push(hdr);
       const h = this._h.length;
       this._byHash.set(this.codec.blockHash(hdr), h);
       this._work.push(this._work[h - 1] + this.he.work(hdr));
     }
   }
-  _toBytes() {
-    return Buffer.from(this._h.map((h) => this.codec.encodeHex('BlockHeader', h)).join(''), 'hex');
-  }
+  _toBytes() { return hexToBytes(this._h.map((h) => this.codec.encodeHex('BlockHeader', h)).join('')); }
 
   async load() {}   // override
   async flush() {}  // override
@@ -87,11 +85,13 @@ export class FileHeaderStore extends HeaderStore {
     this.path = path;
   }
   async load() {
+    const { readFile } = await import('node:fs/promises');
     try { this._ingestBytes(new Uint8Array(await readFile(this.path))); } catch {}
     return this;
   }
   async flush() {
     if (!this._dirty) return;
+    const { writeFile, mkdir } = await import('node:fs/promises');
     await mkdir(new URL('.', this.path), { recursive: true });
     await writeFile(this.path, this._toBytes());
     this._dirty = false;
