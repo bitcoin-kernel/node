@@ -10,7 +10,20 @@ export class Peer {
     this.codec = codec;
     this.buf = new Uint8Array(0);
     this.waiters = [];
+    this.listeners = [];
     this.closed = false;
+  }
+
+  // Collect `count` messages of `command` (for pipelined batch downloads).
+  collect(command, count, timeoutMs = 60000) {
+    return new Promise((resolve, reject) => {
+      const out = [];
+      const l = { command, fn: (msg) => { out.push(msg); if (out.length >= count) { done(); resolve(out); } } };
+      const timer = setTimeout(() => { done(); reject(new Error(`collect timeout: ${out.length}/${count} ${command}`)); }, timeoutMs);
+      const done = () => { clearTimeout(timer); const i = this.listeners.indexOf(l); if (i >= 0) this.listeners.splice(i, 1); };
+      l.cancel = () => { done(); reject(new Error('peer closed')); };
+      this.listeners.push(l);
+    });
   }
 
   connect(host, port, { userAgent = '/bitcoin-kernel-node:0.0.0/', connectTimeout = 8000 } = {}) {
@@ -53,6 +66,7 @@ export class Peer {
   #dispatch(msg) {
     if (msg.command === 'version') { this.peerVersion = msg.payload; this.send('verack'); return; }
     if (msg.command === 'ping') { this.send('pong', { nonce: msg.payload?.nonce ?? 0 }); return; }
+    for (const l of this.listeners) { if (l.command === msg.command) { l.fn(msg); return; } }
     for (let i = this.waiters.length - 1; i >= 0; i--) {
       if (this.waiters[i].commands.includes(msg.command)) {
         const w = this.waiters.splice(i, 1)[0];
@@ -68,5 +82,6 @@ export class Peer {
     if (this.closed) return;
     this.closed = true;
     for (const w of this.waiters.splice(0)) { clearTimeout(w.timer); w.reject(err); }
+    for (const l of this.listeners.splice(0)) l.cancel?.();
   }
 }

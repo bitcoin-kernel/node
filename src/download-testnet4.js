@@ -53,28 +53,41 @@ let start = 1, bytes = 0;
 try { const c = JSON.parse(await readFile(CKPT, 'utf8')); start = c.height + 1; bytes = c.bytes || 0; console.log(`resuming download from ${fmt(start)} (${(bytes / 1e9).toFixed(2)} GB so far)`); } catch {}
 
 const TIP = store.height;
+const BATCH = Number(process.env.BATCH || 256); // pipelined: one getdata per batch
 const t0 = Date.now();
 let done = 0;
 const checkpoint = async (h) => { await mkdir(DATA, { recursive: true }); await writeFile(CKPT, JSON.stringify({ height: h, bytes })); };
 
-for (let h = start; h <= TIP; h++) {
-  const wantHash = codec.blockHash(store.headerAt(h));
-  let block;
-  try { block = await getBlock(peer, wantHash); }
-  catch { peer.close(); peer = await firstPeer(); block = await getBlock(peer, wantHash); }
-
-  const root = codec.merkleRoot(block.transactions.map((t) => codec.txid(t)));
-  if (root !== store.headerAt(h).merkleRoot) { console.error(`\n✗ height ${fmt(h)}: merkle mismatch`); await checkpoint(h - 1); process.exit(1); }
-  bytes += codec.encodeHex('Block', block).length / 2;
-  done++;
-
-  if (h % 500 === 0 || h === TIP) {
-    const secs = (Date.now() - t0) / 1000;
-    const rate = done / secs;
-    const eta = (TIP - h) / rate / 60;
-    process.stdout.write(`\r  verified ${fmt(h)}/${fmt(TIP)}  |  ${rate.toFixed(0)} blk/s  |  ${(bytes / 1e9).toFixed(2)} GB  |  ${(secs / 60).toFixed(0)} min, ETA ${eta.toFixed(0)} min   `);
-    if (h % 2000 === 0) await checkpoint(h);
+// fetch a contiguous [lo, hi] window in one getdata, return Map(blockHash -> block)
+async function fetchWindow(lo, hi) {
+  const hashes = [];
+  for (let k = lo; k <= hi; k++) hashes.push(codec.blockHash(store.headerAt(k)));
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      peer.send('getdata', { items: hashes.map((hash) => ({ type: WITNESS_BLOCK, hash })) });
+      const msgs = await peer.collect('block', hashes.length, 90000);
+      return new Map(msgs.map((m) => [codec.blockHash(m.payload.header), m.payload]));
+    } catch { peer.close(); peer = await firstPeer(); }
   }
+  throw new Error(`could not fetch window ${lo}..${hi}`);
+}
+
+for (let h = start; h <= TIP; h += BATCH) {
+  const hi = Math.min(TIP, h + BATCH - 1);
+  const blocks = await fetchWindow(h, hi);
+  for (let k = h; k <= hi; k++) {
+    const block = blocks.get(codec.blockHash(store.headerAt(k)));
+    if (!block) { console.error(`\n✗ height ${fmt(k)}: peer omitted this block`); await checkpoint(k - 1); process.exit(1); }
+    const root = codec.merkleRoot(block.transactions.map((t) => codec.txid(t)));
+    if (root !== store.headerAt(k).merkleRoot) { console.error(`\n✗ height ${fmt(k)}: merkle mismatch`); await checkpoint(k - 1); process.exit(1); }
+    bytes += codec.encodeHex('Block', block).length / 2;
+    done++;
+  }
+  const secs = (Date.now() - t0) / 1000;
+  const rate = done / secs;
+  const eta = (TIP - hi) / rate / 60;
+  process.stdout.write(`\r  verified ${fmt(hi)}/${fmt(TIP)}  |  ${rate.toFixed(0)} blk/s  |  ${(bytes / 1e9).toFixed(2)} GB  |  ${(secs / 60).toFixed(1)} min, ETA ${eta.toFixed(1)} min   `);
+  await checkpoint(hi);
 }
 peer.close();
 await checkpoint(TIP);
