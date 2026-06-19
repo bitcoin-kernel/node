@@ -17,6 +17,8 @@ import { Codec } from '@bitcoin-desktop/schema/codec/codec.js';
 import { P2pEngine } from '@bitcoin-desktop/schema/codec/p2p.js';
 import { HeaderEngine } from '@bitcoin-desktop/schema/codec/headers.js';
 import { BlockEngine } from '@bitcoin-desktop/schema/codec/blocks.js';
+import { setVerifyBackend } from '@bitcoin-desktop/schema/codec/secp256k1.js';
+import { wasmBackend } from './wasm-secp.js';
 import { Peer } from './peer.js';
 import { FileHeaderStore } from './store/header-store.js';
 import { FileBlockStore } from './store/block-store.js';
@@ -30,6 +32,11 @@ const scriptSchema = await load('schema/script.jsonld');
 const p2pSchema = await load('schema/p2p.jsonld');
 const t4 = await load('test/vectors/testnet4.json');
 const params = chainSchema['@graph'].find((n) => n['@id'] === 'btc:testnet4');
+
+// Swap the engine's pure-JS secp for WASM libsecp256k1 (~16x), proven
+// consensus-equivalent on Bitcoin Core's script vectors (test/wasm-secp.test.js).
+// This is what makes the inscription-flood blocks feasible to validate.
+setVerifyBackend(wasmBackend);
 
 const p2p = P2pEngine.fromSchemas(codec, p2pSchema, chainSchema, 'btc:testnet4');
 const he = HeaderEngine.fromSchemas(codec, chainSchema, validateSchema, 'btc:testnet4');
