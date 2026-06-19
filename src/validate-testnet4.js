@@ -115,10 +115,15 @@ for (let h = start; h <= TIP; h += BATCH) {
     const root = codec.merkleRoot(block.transactions.map((t) => codec.txid(t)));
     if (root !== store.headerAt(k).merkleRoot) { console.error(`\n✗ height ${fmt(k)}: merkle mismatch (fatal)`); summary(); await checkpoint(k - 1); process.exit(1); }
     const times = []; for (let j = Math.max(1, k - 11); j < k; j++) times.push(store.headerAt(j).time);
-    const ctx = be.validateBlockContext(block, { height: k, utxo, external: new Map(), mtp: median(times) });
-    for (const r of [...be.validateBlockStructure(block).results, ...ctx.results]) if (r.ok === false) warn(r.label, r.error, k);
-    if (ctx.spending?.valueUnresolved > 0) warn('value-unresolved', String(ctx.spending.valueUnresolved), k);
-    be.applyBlock(utxo, block, k);
+    // The real chain is valid, so a rule failure OR a thrown exception is an
+    // engine bug: log both as discrepancies and keep going (don't let one block
+    // crash the audit).
+    try {
+      const ctx = be.validateBlockContext(block, { height: k, utxo, external: new Map(), mtp: median(times) });
+      for (const r of [...be.validateBlockStructure(block).results, ...ctx.results]) if (r.ok === false) warn(r.label, r.error, k);
+      if (ctx.spending?.valueUnresolved > 0) warn('value-unresolved', String(ctx.spending.valueUnresolved), k);
+    } catch (e) { warn('engine-threw', String(e.message).slice(0, 50), k); }
+    try { be.applyBlock(utxo, block, k); } catch (e) { warn('applyBlock-threw', String(e.message).slice(0, 40), k); }
     validated++; txs += block.transactions.length; lastH = k;
   }
   const secs = (Date.now() - t0) / 1000, rate = validated / secs;
