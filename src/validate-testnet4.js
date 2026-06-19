@@ -19,6 +19,7 @@ import { HeaderEngine } from '@bitcoin-desktop/schema/codec/headers.js';
 import { BlockEngine } from '@bitcoin-desktop/schema/codec/blocks.js';
 import { Peer } from './peer.js';
 import { FileHeaderStore } from './store/header-store.js';
+import { FileBlockStore } from './store/block-store.js';
 import { HeaderSync } from './chain/header-sync.js';
 
 const load = async (p) => JSON.parse(await readFile(new URL(import.meta.resolve('@bitcoin-desktop/schema/' + p)), 'utf8'));
@@ -49,10 +50,17 @@ async function candidates() { const c = []; for (const s of SEEDS) { try { for (
 async function firstPeer() { const hosts = await candidates(); while (hosts.length) { const peer = new Peer(p2p, codec); try { await peer.connect(hosts.shift(), params.port); return peer; } catch { peer.close(); } } throw new Error('no peer'); }
 
 const store = new FileHeaderStore(codec, he, genesisHeader, HEADERS_FILE);
+const blockStore = new FileBlockStore(DATA, codec);
 await store.load();
-let peer = await firstPeer();
-console.log(`syncing headers (have ${fmt(store.height)})...`);
-await new HeaderSync(store, he, codec).sync(async (locator) => { peer.send('getheaders', { version: 70016, blockLocator: locator, hashStop: '0'.repeat(64) }); return (await peer.waitFor(['headers'])).payload?.entries?.map((e) => e.header) ?? []; });
+
+// A peer is optional: needed only to top up headers and to fetch blocks the
+// BlockStore is missing. With a complete store, this validates fully offline.
+let peer = null;
+try {
+  peer = await firstPeer();
+  console.log(`syncing headers (have ${fmt(store.height)})...`);
+  await new HeaderSync(store, he, codec).sync(async (locator) => { peer.send('getheaders', { version: 70016, blockLocator: locator, hashStop: '0'.repeat(64) }); return (await peer.waitFor(['headers'])).payload?.entries?.map((e) => e.header) ?? []; });
+} catch (e) { console.log(`offline: validating from the local store (no peer: ${e.message})`); }
 console.log(`header tip: ${fmt(store.height)}`);
 
 // resume
@@ -74,16 +82,23 @@ function summary() {
 }
 process.on('SIGINT', async () => { summary(); await checkpoint(lastH); process.exit(0); });
 
+let fromDisk = 0, fromNet = 0;
 async function fetchWindow(lo, hi) {
-  const want = new Map(); for (let k = lo; k <= hi; k++) want.set(codec.blockHash(store.headerAt(k)), k);
   const win = new Map();
-  for (let attempt = 0; win.size < hi - lo + 1 && attempt < 5; attempt++) {
-    const need = [...want.entries()].filter(([, k]) => !win.has(k)).map(([hash]) => hash);
-    if (!need.length) break;
-    try { peer.send('getdata', { items: need.map((hash) => ({ type: WITNESS_BLOCK, hash })) }); await peer.collect('block', need.length, { timeoutMs: 120000, onItem: (m) => { const b = m.payload; const k = want.get(codec.blockHash(b.header)); if (k != null) win.set(k, b); } }); }
-    catch { peer.close(); peer = await firstPeer(); }
+  const want = new Map(); // hash -> height, for blocks not on disk
+  for (let k = lo; k <= hi; k++) {
+    const b = blockStore.get(k);
+    if (b) { win.set(k, b); fromDisk++; } else want.set(codec.blockHash(store.headerAt(k)), k);
   }
-  if (win.size < hi - lo + 1) throw new Error(`window ${lo}..${hi} incomplete (${win.size}/${hi - lo + 1})`);
+  for (let attempt = 0; want.size && attempt < 5; attempt++) {
+    if (!peer) peer = await firstPeer();
+    const need = [...want.keys()];
+    try {
+      peer.send('getdata', { items: need.map((hash) => ({ type: WITNESS_BLOCK, hash })) });
+      await peer.collect('block', need.length, { timeoutMs: 120000, onItem: (m) => { const b = m.payload; const hash = codec.blockHash(b.header); const k = want.get(hash); if (k != null) { blockStore.putSync(k, b); win.set(k, b); want.delete(hash); fromNet++; } } });
+    } catch { try { peer?.close(); } catch {} peer = null; }
+  }
+  if (want.size) throw new Error(`window ${lo}..${hi}: ${want.size} block(s) not in store and no peer`);
   return win;
 }
 
@@ -102,7 +117,7 @@ for (let h = start; h <= TIP; h += BATCH) {
     validated++; txs += block.transactions.length; lastH = k;
   }
   const secs = (Date.now() - t0) / 1000, rate = validated / secs;
-  process.stdout.write(`\r  validated ${fmt(hi)}/${fmt(TIP)}  |  ${rate.toFixed(0)} blk/s  |  ${fmt(txs)} tx  |  utxo ${fmt(utxo.size)}  |  warns ${warnings.size}  |  ${(secs / 60).toFixed(1)} min, ETA ${((TIP - hi) / rate / 60).toFixed(0)} min   `);
+  process.stdout.write(`\r  validated ${fmt(hi)}/${fmt(TIP)}  |  ${rate.toFixed(0)} blk/s  |  disk ${fmt(fromDisk)} net ${fmt(fromNet)}  |  utxo ${fmt(utxo.size)}  |  warns ${warnings.size}  |  ETA ${((TIP - hi) / rate / 60).toFixed(0)} min   `);
   if (hi % 2000 < BATCH) await checkpoint(hi);
 }
 await checkpoint(TIP);
