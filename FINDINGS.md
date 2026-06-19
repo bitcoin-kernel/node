@@ -55,6 +55,30 @@ overnight grind in pure JS — which is exactly the case for WASM.
   `OpfsBlockStore`, `WsPeer` (the three swaps; the base `HeaderStore` is
   browser-safe). A browser node is now assembly, not new design.
 
+## The pure-JS wall, confirmed: full validation is infeasible on the flood
+
+The full-validation audit got through **~51,500 blocks** (validating ~500k+
+transactions, surfacing the three bugs above), then **stalled** on testnet4's
+inscription/dust-flood stretch. Those blocks carry **~10k+ inputs each** (the
+UTXO set churns by 100k+ per block as dust is consolidated), i.e. tens of
+thousands of script/signature verifications per block. At the engine's pure-JS
+**~248 verifies/sec**, a single flood block takes **>14 minutes**; the validator
+made **zero progress across two consecutive 14-minute checks** on one such block.
+A sustained run of these blocks would take **months**.
+
+This is the concrete, final form of the performance finding: on real spam-era
+data, **WASM-secp is not an optimization — it is the difference between
+"completes" and "doesn't."** The remedy is the M0.1 path: a WASM-SIMD
+libsecp256k1 with **batch verification** (the per-call WASM figure is already
+~16x the pure-JS engine, and batching amortises the JS↔WASM boundary that
+dominates). The architecture, storage, validation logic, and bug-finding all
+work; the only thing standing between this and a completed full validation is
+the crypto backend. A third engine bug (#62) and a validator robustness fix
+(catch engine exceptions) came directly out of pushing it this far.
+
+Bottom line: **~51.5k blocks fully validated, 3 engine bugs found and filed, the
+whole chain archived (11.9 GB), and the WASM requirement proven on real data.**
+
 ## Honest boundaries
 
 - testnet4 only here (mainnet is a network-param flip; not run).
