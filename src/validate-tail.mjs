@@ -26,15 +26,17 @@ const chainSchema = await load('schema/chain.jsonld');
 const validateSchema = await load('schema/validate.jsonld');
 const scriptSchema = await load('schema/script.jsonld');
 const t4 = await load('test/vectors/testnet4.json');
-// Signature verification: NOPOOL=1 -> inline WASM (fast for light post-flood
-// blocks, where pool dispatch overhead exceeds the few sigs it parallelizes);
-// default -> worker-thread pool (CCheckQueue 3-phase, fast for the heavy flood).
-const NOPOOL = process.env.NOPOOL === '1';
-let pool = null, defer = null;
-if (NOPOOL) { setVerifyBackend(wasmBackend); }
-else { pool = new VerifyPool(); defer = makeDeferBackend(); setVerifyBackend(defer.backend); }
+// Hybrid signature verification, decided per block by input count: inline WASM
+// for light blocks (<= LIGHT inputs; avoids the pool's per-block dispatch
+// overhead), worker-thread pool for heavy blocks (parallel sig verify pays off).
+// testnet4's tail mixes light blocks with occasional flood-magnitude spam blocks,
+// so neither pure mode wins — this gets the best of both.
+const pool = new VerifyPool();
+const defer = makeDeferBackend();
+setVerifyBackend(defer.backend);
 setSha256Backend(nativeSha256);
-console.log(NOPOOL ? 'verify: inline WASM (no pool)' : `verify: ${pool.size}-worker pool`);
+const LIGHT = Number(process.env.LIGHT_THRESHOLD || 600);
+console.log(`verify: hybrid (inline <=${LIGHT} inputs, ${pool.size}-worker pool above)`);
 const he = HeaderEngine.fromSchemas(codec, chainSchema, validateSchema, 'btc:testnet4');
 const be = BlockEngine.fromSchemas(codec, chainSchema, validateSchema, scriptSchema, 'btc:testnet4');
 
@@ -79,11 +81,14 @@ for (let h = start; h <= TIP; h++) {
     const times = []; for (let j = Math.max(1, h - 11); j < h; j++) times.push(store.headerAt(j).time);
     const mtp = median(times);
     const collect = (ctx, results) => { const w = []; for (const r of results) if (r.ok === false) w.push([r.label, r.error]); if (ctx?.spending?.valueUnresolved > 0) w.push(['value-unresolved', String(ctx.spending.valueUnresolved)]); return w; };
-    if (NOPOOL) {
+    let ins = 0; for (const tx of block.transactions) ins += tx.inputs.length;
+    if (ins <= LIGHT) {
+      setVerifyBackend(wasmBackend);
       try {
         const ctx = be.validateBlockContext(block, { height: h, utxo, external: new Map(), mtp });
         for (const [l, e] of collect(ctx, [...be.validateBlockStructure(block).results, ...ctx.results])) warn(l, e, h);
       } catch (e) { warn('engine-threw', String(e.message).slice(0, 50), h); }
+      setVerifyBackend(defer.backend);
     } else {
       let pend = null, threw = null;
       try {
