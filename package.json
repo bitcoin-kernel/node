@@ -1,5 +1,6 @@
 {
   "name": "bitcoin-kernel-node",
+  "license": "AGPL-3.0-or-later",
   "version": "0.0.0",
   "private": true,
   "type": "module",
